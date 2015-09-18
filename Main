@@ -1,0 +1,180 @@
+#include <CS_MQ7.h>
+#include <TinyGPS++.h>
+#include <AltSoftSerial.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <SoftwareSerial.h>
+
+// XBee's DOUT (TX)-(Arduino's Software RX)
+// XBee's DIN (RX)-(Arduino's Software TX)
+SoftwareSerial xB(2, 3); // RX, TX
+AltSoftSerial ss;
+TinyGPSPlus GPS;
+
+#define ONE_WIRE_BUS 4 //Fio de datos no conector #4
+OneWire oneWire(ONE_WIRE_BUS);
+
+DallasTemperature sensors(&oneWire); // Passar a referencia oneWire para o sensor Dallas.
+
+char packetBuffer[256];
+char incomingBuffer[64];
+char mac[8];
+int bufferIndex = 0;
+//const char *publicKey = "6Jd3E9WmQ6hg22VGDy31";
+//const char *privateKey = "WwVmAg2J8XU4WWYZo9l6";
+int outputpin= 0;
+int sensorMonox;
+
+
+//  Variables
+int pulsePin = 0;                 // Pulse Sensor purple wire connected to analog pin 0
+int blinkPin = 13;                // pin to blink led at each beat
+int fadePin = 5;                  // pin to do fancy classy fading blink at each beat
+int fadeRate = 0;                 // used to fade LED on with PWM on fadePin
+static int bpm;
+
+// Volatile Variables, used in the interrupt service routine!
+volatile int BPM;                   // int that holds raw Analog in 0. updated every 2mS
+volatile int Signal;                // holds the incoming raw data
+volatile int IBI = 600;             // int that holds the time interval between beats! Must be seeded! 
+volatile boolean Pulse = false;     // "True" when User's live heartbeat is detected. "False" when not a "live beat". 
+volatile boolean QS = false;        // becomes true when Arduoino finds a beat.
+
+static boolean serialVisual = false;   
+
+  
+
+void setup()
+{        
+        interruptSetup();
+
+        ss.begin(9600);       
+        delay(1000);
+        
+        xB.begin(9600);
+        delay(1000);
+          
+        sensors.begin();          
+        delay(500);         
+        
+        Serial.begin(9600);
+        delay(1000);
+                     
+        while(!Serial) { } //Espera pela Serial
+ 
+        Serial.println("Inicio Setup");
+        xB.print("+++"); /* Entra no Command Mode */
+        delay(2000);
+        
+        /**************** Configura dados do XBee ***************/
+        while ( xB.available() )
+        {
+                incomingBuffer[bufferIndex] = xB.read();
+                bufferIndex++;
+               
+                if (strcmp(incomingBuffer, "OK") == 0)
+                {
+                        xB.print("ATSL\r");
+                        delay(200);                                             
+                 }   
+                    xB.print("ATIP1\r");  /* Protocolo TCP */
+                    xB.print("ATDL 54.172.56.193\r");  /* Servidor destino -> Dweet.io */
+                    xB.print("ATDE50\r"); /* Porto 80 (0x50) */
+                    xB.print("ATCN\r"); /* Sai do Command Mode */
+          }                
+       Serial.println("Fim Setup");
+ }
+         
+    
+void loop()
+{    
+        char bodyBuffer[256]; //Pacote com 226 bytes! Atençao!
+        char bodyBuffer_aux[128];
+        char bodyBuffer_auxx[32];	
+        float fTemp;
+        char buff[10];
+        char aux[10];  
+        double latitudeDegrees=0;
+        double longitudeDegrees=0;    
+        
+        Serial.println("Inicio_loop");          
+       
+         /*****************  Obtem Dados do GPS  ****************/  
+            while (ss.available() <= 0){        
+              delay(1000);
+            }
+        
+            while(ss.available() > 0)        
+            GPS.encode(ss.read());
+        
+            latitudeDegrees=GPS.location.lat(); //return latitude as a double
+            longitudeDegrees=GPS.location.lng(); //return longitude as a double                                          
+                                          
+            /***************  Obtem temperatura do Sensor************/
+            sensors.requestTemperatures();
+            fTemp = sensors.getTempCByIndex(0);        
+            Serial.println(fTemp);            
+
+            strcpy(bodyBuffer, "?temp=");
+            dtostrf(fTemp, 2, 2, aux);  //4 is mininum width, 3 is precision;
+            strcpy(bodyBuffer_aux, aux );            
+            
+            strcat(bodyBuffer, bodyBuffer_aux);
+            
+            *aux=NULL;         
+            
+            *bodyBuffer_aux=NULL;
+            
+             /***************  Obtem Monoxido  ************/
+            sensorMonox = analogRead(1); // Pin analog 1
+            //Serial.print("Monoxido="); 
+            //Serial.println(sensorMonox,DEC);
+            delay(100);
+            
+            strcat(bodyBuffer, "&monox=");            
+            itoa(sensorMonox,aux,10); //(integer, yourBuffer, base)
+            strcat(bodyBuffer, aux); 
+           
+            *bodyBuffer_aux=NULL;
+            delay(1000);  
+         
+             /**************** Obtem dados do PulseSensor ***********/                                 
+              if (QS == true){     //  A Heartbeat Was Found
+                                                                      
+                  serialOutputWhenBeatHappens();   
+                   // bpm = BPM;  //ALTERADO!
+                  QS = false;   
+                 }                    
+               //bpm =0;    
+	          strcat(bodyBuffer, "&bpm=");            
+            itoa(BPM,aux,10); //(integer, yourBuffer, base)
+            strcat(bodyBuffer, aux); 
+                      
+             /**************** Concatena dados do GPS ***********/                             
+            strcpy(bodyBuffer_aux, "&latitude=");       
+            dtostrf(latitudeDegrees, 8, 7, buff);
+                  	
+            strcat(bodyBuffer_aux, buff); // passa o float para string
+            strcat(bodyBuffer, bodyBuffer_aux);
+                       
+            *bodyBuffer_aux=NULL;
+            memset(buff,0,strlen(buff));
+            
+            strcpy(bodyBuffer_aux, "&longitude=");        
+            dtostrf(longitudeDegrees, 8, 7, buff);
+            strcat(bodyBuffer_aux, buff); // passa o float para string
+            strcat(bodyBuffer, bodyBuffer_aux);
+            
+            /**************** Cria POST request ***********/ 
+            strcpy(packetBuffer, "POST /dweet/for/teste4");
+            strcat(packetBuffer, bodyBuffer);        
+            strcat(packetBuffer, " HTTP/1.1\r\n");
+            strcat(packetBuffer, "Host: dweet.io\r\n");
+            strcat(packetBuffer, "Connection: keep-alive\r\n");            
+            strcat(packetBuffer, "Accept:*/*\r\n\r\n");          
+                    
+            /**************** Envia string para o XBee ***********/ 
+            xB.println(packetBuffer);
+            Serial.println(packetBuffer);  //a retirar
+            delay(10000);             
+}
